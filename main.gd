@@ -3,7 +3,7 @@ extends Node2D
 const W := 540.0
 const H := 960.0
 const GROUND_Y := 830.0
-const BH := 46.0
+const BH := 34.0   # vertical distance between stacked pancakes (smaller = tighter stack)
 const BASE_W := 260.0
 const MIN_W := 70.0
 const PERFECT_TOL := 7.0
@@ -11,8 +11,31 @@ const WOB_LIMIT := 45.0
 const CAM_TOP := 660.0
 const SLIDER_GAP := 150.0
 const MASC_PLAY := 165.0
+const PANCAKE_H := 1.9   # drawn pancake height as a multiple of BH (about 65 px)
 const FALL_GRAV := 2600.0
 const START_LIVES := 3
+const MILESTONES := {
+	10: ["NICE!", Color(0.6, 1.0, 0.7)],
+	25: ["WOW!", Color(1.0, 0.85, 0.3)],
+	50: ["LEGEND!", Color(1.0, 0.5, 0.7)],
+	100: ["UNSTOPPABLE!", Color(0.6, 0.8, 1.0)],
+}
+# Pool of daily tasks. 3 different kinds are picked each day, seeded by the date.
+const TASK_POOL := [
+	{"kind": "height", "goal": 15, "reward": 15, "name": "Stack 15 pancakes in one run"},
+	{"kind": "height", "goal": 25, "reward": 20, "name": "Stack 25 pancakes in one run"},
+	{"kind": "height", "goal": 40, "reward": 30, "name": "Stack 40 pancakes in one run"},
+	{"kind": "row", "goal": 3, "reward": 15, "name": "Land 3 perfects in a row"},
+	{"kind": "row", "goal": 5, "reward": 20, "name": "Land 5 perfects in a row"},
+	{"kind": "heal", "goal": 1, "reward": 30, "name": "Win back a life"},
+	{"kind": "perfects", "goal": 15, "reward": 20, "name": "Land 15 perfects today"},
+	{"kind": "coins", "goal": 50, "reward": 20, "name": "Collect 50 coins in one run"},
+	{"kind": "score", "goal": 40, "reward": 20, "name": "Score 40 in one run"},
+	{"kind": "score", "goal": 80, "reward": 30, "name": "Score 80 in one run"},
+]
+const TASKS_RECT := Rect2(14, 76, 76, 76)
+const REVIVE_COST := 50
+const REVIVE_RECT := Rect2(110, 365, 320, 80)
 const SAVE_PATH := "user://save.cfg"
 
 const MASCOTS := ["orpheus", "hedgehog"]
@@ -20,7 +43,7 @@ const OUTFITS := ["", "chef", "hacker", "wizard"]
 const OUTFIT_COST := {"chef": 30, "hacker": 100, "wizard": 250}
 const BGS := ["bg_sky", "bg_kitchen", "bg_night", "bg_peach", "bg_pink"]
 const FOLDERS := ["", "characters/", "blocks/", "ui/", "backgrounds/"]
-const TRIM := ["pancake", "plate", "rail", "coin", "heart", "heart_empty", "lock", "button", "logo"]
+const TRIM := ["pancake", "plate", "rail", "coin", "heart", "heart_empty", "lock", "button", "logo", "clipboard", "tshirt"]
 
 const GO_RECT := Rect2(150, 800, 240, 110)
 const WARD_RECT := Rect2(30, 810, 100, 100)
@@ -57,6 +80,13 @@ var input_lock := 0.0
 var is_dying := false
 var over_delay := 0.0
 var over_age := 0.0
+var revived := false      # one paid revive per run
+var was_low := false      # dropped to 1 life at some point (for the comeback bonus)
+var task_date := ""
+var task_ids: Array = [0, 3, 5]
+var task_prog: Array = [0, 0, 0]
+var task_done: Array = [false, false, false]
+var heart_pulse := 0.0   # heart bounce animation timer (1 -> 0)
 
 var hop_t := 1.0
 var hop_amp := 55.0
@@ -86,6 +116,7 @@ func _ready() -> void:
 func load_save() -> void:
 	var cf := ConfigFile.new()
 	if cf.load(SAVE_PATH) != OK:
+		check_task_day()
 		return
 	best = int(cf.get_value("g", "best", 0))
 	total_coins = int(cf.get_value("g", "coins", 0))
@@ -93,6 +124,82 @@ func load_save() -> void:
 	owned = cf.get_value("g", "owned", [])
 	outfit_of["orpheus"] = str(cf.get_value("g", "o_orpheus", ""))
 	outfit_of["hedgehog"] = str(cf.get_value("g", "o_hedgehog", ""))
+	task_date = str(cf.get_value("g", "t_date", ""))
+	var tp: Array = cf.get_value("g", "t_prog", [0, 0, 0])
+	var td: Array = cf.get_value("g", "t_done", [false, false, false])
+	if tp.size() == 3 and td.size() == 3:
+		task_prog = tp
+		task_done = td
+	check_task_day()
+
+
+## New day: progress resets. Today's 3 tasks are always picked from the date, so they change every day.
+func check_task_day() -> void:
+	var today := Time.get_date_string_from_system()
+	if task_date != today:
+		task_date = today
+		task_prog = [0, 0, 0]
+		task_done = [false, false, false]
+	pick_tasks()
+
+
+## Picks 3 tasks of different kinds, seeded by the date (same all day, different tomorrow).
+func pick_tasks() -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = task_date.hash()
+	var idx: Array = range(TASK_POOL.size())
+	for a in range(idx.size() - 1, 0, -1):
+		var b := rng.randi_range(0, a)
+		var tmp: Variant = idx[a]
+		idx[a] = idx[b]
+		idx[b] = tmp
+	var kinds: Array = []
+	var picked: Array = []
+	for k in idx:
+		var kind: String = TASK_POOL[k]["kind"]
+		if not kinds.has(kind):
+			kinds.append(kind)
+			picked.append(k)
+			if picked.size() == 3:
+				break
+	task_ids = picked
+
+
+## Tells every task of this kind about an event.
+func task_event(kind: String, val: int) -> void:
+	for i in 3:
+		var tdef: Dictionary = TASK_POOL[int(task_ids[i])]
+		if tdef["kind"] == kind:
+			update_task(i, val)
+
+
+## Progress for one task. Finishing it pays coins once per day.
+func update_task(i: int, val: int) -> void:
+	if bool(task_done[i]):
+		return
+	var tdef: Dictionary = TASK_POOL[int(task_ids[i])]
+	if tdef["kind"] == "heal" or tdef["kind"] == "perfects":
+		task_prog[i] = int(task_prog[i]) + val
+	else:
+		task_prog[i] = maxi(int(task_prog[i]), val)
+	if int(task_prog[i]) >= int(tdef["goal"]):
+		task_done[i] = true
+		add_coins(int(tdef["reward"]))
+		add_popup("TASK DONE! +%d" % int(tdef["reward"]), W * 0.5, 570.0, Color(0.6, 1.0, 0.7))
+		play_snd("unlock")
+		save_game()
+
+
+## Popup and dance when the tower passes a milestone. Returns true if one was hit.
+func check_milestone(n: int) -> bool:
+	if not MILESTONES.has(n):
+		return false
+	var m: Array = MILESTONES[n]
+	add_popup(str(m[0]), W * 0.5, 270.0, m[1])
+	burst(Vector2(W * 0.5, 420.0), 24, m[1])
+	set_pose("happy", 1.2)
+	play_snd("unlock")
+	return true
 
 
 func save_game() -> void:
@@ -103,6 +210,9 @@ func save_game() -> void:
 	cf.set_value("g", "owned", owned)
 	cf.set_value("g", "o_orpheus", outfit_of["orpheus"])
 	cf.set_value("g", "o_hedgehog", outfit_of["hedgehog"])
+	cf.set_value("g", "t_date", task_date)
+	cf.set_value("g", "t_prog", task_prog)
+	cf.set_value("g", "t_done", task_done)
 	cf.save(SAVE_PATH)
 
 
@@ -177,13 +287,40 @@ func get_tex(nm: String) -> Dictionary:
 					if img != null:
 						if img.is_compressed():
 							img.decompress()
-						var ur := img.get_used_rect()
-						if ur.size.x > 0 and ur.size.y > 0:
-							r = Rect2(ur)
+						var ur := alpha_rect(img)
+						if ur.size.x > 0.0 and ur.size.y > 0.0:
+							r = ur
 				entry["r"] = r
 				break
 	_cache[nm] = entry
 	return entry
+
+
+## Bounding box of the visible pixels. Ignores faint leftover alpha (shadows, background-remover fringe).
+func alpha_rect(img: Image) -> Rect2:
+	var iw := img.get_width()
+	var ih := img.get_height()
+	var sc: float = minf(1.0, 160.0 / float(maxi(iw, ih)))
+	var small: Image = img.duplicate()
+	small.resize(maxi(1, int(iw * sc)), maxi(1, int(ih * sc)))
+	var x0 := small.get_width()
+	var y0 := small.get_height()
+	var x1 := -1
+	var y1 := -1
+	for y in small.get_height():
+		for x in small.get_width():
+			if small.get_pixel(x, y).a > 0.3:
+				x0 = mini(x0, x)
+				y0 = mini(y0, y)
+				x1 = maxi(x1, x)
+				y1 = maxi(y1, y)
+	if x1 < 0:
+		return Rect2(0, 0, iw, ih)
+	var rx: float = floorf(float(x0) / sc)
+	var ry: float = floorf(float(y0) / sc)
+	var rw: float = minf(ceilf(float(x1 + 1) / sc), float(iw)) - rx
+	var rh: float = minf(ceilf(float(y1 + 1) / sc), float(ih)) - ry
+	return Rect2(rx, ry, rw, rh)
 
 
 func dimg(nm: String, rect: Rect2, mod: Color = Color.WHITE) -> bool:
@@ -219,6 +356,13 @@ func draw_button(r: Rect2, label: String, size: int, col: Color) -> void:
 	txt(label, r.position.x + r.size.x * 0.5, r.position.y + r.size.y * 0.5 + size * 0.35, size, col, 6)
 
 
+## Button with an icon image (assets/ui/<icon>.png). Falls back to text if the icon is missing.
+func draw_icon_button(r: Rect2, icon: String, label: String) -> void:
+	draw_button(r, "", 24, Color.WHITE)
+	if not dfit(icon, r.get_center(), r.size.x * 0.7, r.size.y * 0.7):
+		txt(label, r.get_center().x, r.get_center().y + 7.0, 18, Color(0.4, 0.5, 0.7), 5)
+
+
 func draw_bg(idx: int) -> void:
 	var nm: String = BGS[idx % BGS.size()]
 	var e: Dictionary = get_tex(nm)
@@ -242,7 +386,7 @@ func draw_plate(gy: float) -> void:
 
 ## Draws a pancake; sy gives the squash and stretch bounce.
 func dpancake(cx: float, ytop: float, w: float, mod: Color = Color.WHITE, sy: float = 1.0) -> void:
-	var full_h: float = BH * 1.2 * sy
+	var full_h: float = BH * PANCAKE_H * sy
 	var bottom: float = ytop + BH * 1.1
 	var r := Rect2(cx - w * 0.5, bottom - full_h, w, full_h)
 	if dimg("pancake", r, mod):
@@ -253,14 +397,14 @@ func dpancake(cx: float, ytop: float, w: float, mod: Color = Color.WHITE, sy: fl
 	draw_rect(Rect2(cx - w * 0.5, ytop, w, BH), Color(0.25, 0.15, 0.08), false, 3.0)
 
 
-func draw_heart(c: Vector2, full: bool) -> void:
+func draw_heart(c: Vector2, full: bool, sc: float = 1.0) -> void:
 	var nm := "heart" if full else "heart_empty"
-	if dfit(nm, c, 44.0, 44.0):
+	if dfit(nm, c, 44.0 * sc, 44.0 * sc):
 		return
 	var col := Color(0.9, 0.2, 0.25) if full else Color(0.7, 0.7, 0.72)
-	draw_circle(c + Vector2(-9, -5), 11.0, col)
-	draw_circle(c + Vector2(9, -5), 11.0, col)
-	draw_colored_polygon(PackedVector2Array([c + Vector2(-19, -1), c + Vector2(19, -1), c + Vector2(0, 20)]), col)
+	draw_circle(c + Vector2(-9, -5) * sc, 11.0 * sc, col)
+	draw_circle(c + Vector2(9, -5) * sc, 11.0 * sc, col)
+	draw_colored_polygon(PackedVector2Array([c + Vector2(-19, -1) * sc, c + Vector2(19, -1) * sc, c + Vector2(0, 20) * sc]), col)
 
 
 func draw_coin_pill() -> void:
@@ -321,6 +465,10 @@ func new_game() -> void:
 	beam_t = 0.0
 	shake = 0.0
 	input_lock = 0.25
+	check_task_day()
+	revived = false
+	was_low = false
+	heart_pulse = 0.0
 	spawn_slider()
 	state = "play"
 
@@ -393,6 +541,8 @@ func add_debris(x: float, y_screen: float, w: float, dir: float, is_miss: bool) 
 
 func lose_life() -> void:
 	lives -= 1
+	if lives == 1:
+		was_low = true
 	shake = 0.3
 	set_pose("cry", 0.9)
 	if lives <= 0:
@@ -438,6 +588,8 @@ func resolve_drop() -> void:
 	if absf(d) <= PERFECT_TOL:
 		blocks.append({"x": tx, "w": tw})
 		combo += 1
+		task_event("row", combo)
+		task_event("perfects", 1)
 		score += 2
 		add_coins(3)
 		wob = maxf(0.0, wob - 8.0)
@@ -452,6 +604,12 @@ func resolve_drop() -> void:
 		if combo >= 5 and lives < START_LIVES:
 			lives += 1
 			combo = 0
+			pop_heart()
+			task_event("heal", 1)
+			if lives == START_LIVES and was_low:
+				was_low = false
+				add_coins(10)
+				add_popup("COMEBACK! +10 coins", W * 0.5, 510.0, Color(1.0, 0.85, 0.3))
 			add_popup("BOUNCE BACK! +1 LIFE", W * 0.5, 390.0, Color(1.0, 0.6, 0.7))
 			play_snd("heal")
 	else:
@@ -475,10 +633,47 @@ func resolve_drop() -> void:
 			lose_life()
 		else:
 			wob += 4.0
-	hop_amp = 55.0
-	hop_speed = 3.2
+	task_event("height", blocks.size() - 1)
+	task_event("score", score)
+	task_event("coins", run_coins)
+	if check_milestone(blocks.size() - 1):
+		hop_amp = 130.0
+		hop_speed = 2.2
+	else:
+		hop_amp = 55.0
+		hop_speed = 3.2
 	hop_t = 0.0
 	spawn_slider()
+
+
+## Life gained: the new heart bounces, sparkles, and the screen shakes.
+func pop_heart() -> void:
+	heart_pulse = 1.0
+	shake = 0.25
+	burst(Vector2(W - 40.0 - float(lives - 1) * 50.0, 40.0), 14, Color(1.0, 0.5, 0.65))
+
+
+## Paid revive: spend coins to continue the run with 1 life.
+func try_revive() -> void:
+	if total_coins < REVIVE_COST:
+		play_snd("no")
+		return
+	total_coins -= REVIVE_COST
+	revived = true
+	was_low = true
+	lives = 1
+	pop_heart()
+	is_dying = false
+	dropping = false
+	wob = 0.0
+	combo = 0
+	pose_t = 0.0
+	input_lock = 0.5
+	save_game()
+	add_popup("BOUNCE BACK!", W * 0.5, 330.0, Color(1.0, 0.6, 0.7))
+	play_snd("heal")
+	spawn_slider()
+	state = "play"
 
 
 ## Wobble limit reached: the top pancakes fall and a life is lost.
@@ -522,6 +717,7 @@ func update_effects(dt: float) -> void:
 	pose_t = maxf(0.0, pose_t - dt)
 	beam_t = maxf(0.0, beam_t - dt)
 	shake = maxf(0.0, shake - dt)
+	heart_pulse = maxf(0.0, heart_pulse - dt * 1.4)
 
 	var i := debris.size() - 1
 	while i >= 0:
@@ -604,6 +800,10 @@ func handle_tap(p: Vector2) -> void:
 			if GO_RECT.has_point(p):
 				play_snd("click")
 				new_game()
+			elif TASKS_RECT.has_point(p):
+				play_snd("click")
+				check_task_day()
+				state = "tasks"
 			elif WARD_RECT.has_point(p):
 				play_snd("click")
 				state = "wardrobe"
@@ -626,10 +826,17 @@ func handle_tap(p: Vector2) -> void:
 			for i in 4:
 				if cell_rect(i).has_point(p):
 					select_outfit(OUTFITS[i])
+		"tasks":
+			if BACK_RECT.has_point(p):
+				play_snd("click")
+				state = "title"
 		"play":
 			play_tap()
 		"over":
 			if over_age < 0.35:
+				return
+			if not revived and REVIVE_RECT.has_point(p):
+				try_revive()
 				return
 			if RETRY_RECT.has_point(p) or p.x < 0.0:
 				play_snd("click")
@@ -671,6 +878,8 @@ func _draw() -> void:
 			draw_title()
 		"wardrobe":
 			draw_wardrobe()
+		"tasks":
+			draw_tasks()
 		"play":
 			draw_play(true)
 		"over":
@@ -685,13 +894,15 @@ func draw_title() -> void:
 	if not dfit("logo", Vector2(W * 0.5, 190.0), 470.0, 230.0):
 		txt("STACK", W * 0.5, 160.0, 96, Color(1.0, 0.85, 0.3), 12)
 		txt("ATTACK", W * 0.5, 255.0, 96, Color(1.0, 0.55, 0.45), 12)
+	txt("BOUNCE BACK", W * 0.5, 345.0, 34, Color(1.0, 0.95, 0.7), 7)
 	var gy := 640.0
 	draw_plate(gy)
 	dpancake(W * 0.5, gy - BH, BASE_W)
 	var bob: float = sin(t * 3.0) * 3.0
 	draw_mascot(mascot, outfit_of[mascot], "balance", Vector2(W * 0.5, gy - BH + 4.0 + bob), 270.0)
 	draw_button(GO_RECT, "GO", 72, Color(0.9, 0.35, 0.35))
-	draw_button(WARD_RECT, "DRESS", 24, Color(0.4, 0.5, 0.7))
+	draw_icon_button(WARD_RECT, "tshirt", "DRESS")
+	draw_icon_button(TASKS_RECT, "clipboard", "TASKS")
 	draw_button(MASC_RECT, "", 24, Color(0.4, 0.5, 0.7))
 	var other: String = MASCOTS[(MASCOTS.find(mascot) + 1) % MASCOTS.size()]
 	draw_mascot(other, "", "balance", MASC_RECT.position + Vector2(50, 90), 100.0)
@@ -721,6 +932,29 @@ func draw_wardrobe() -> void:
 			txt(str(OUTFIT_COST[o]), r.position.x + r.size.x * 0.5, r.position.y + 138.0, 34, Color(1.0, 0.95, 0.4), 6)
 		if outfit_of[mascot] == o:
 			draw_rect(r, Color(0.9, 0.3, 0.3), false, 6.0)
+	draw_button(BACK_RECT, "BACK", 30, Color(0.4, 0.5, 0.7))
+
+
+func draw_tasks() -> void:
+	draw_bg(2)
+	draw_coin_pill()
+	txt("DAILY TASKS", W * 0.5, 160.0, 58, Color(1.0, 0.85, 0.3), 10)
+	for i in 3:
+		var tdef: Dictionary = TASK_POOL[int(task_ids[i])]
+		var r := Rect2(40.0, 220.0 + float(i) * 170.0, 460.0, 150.0)
+		draw_rect(r, Color(0.1, 0.15, 0.3, 0.8))
+		draw_rect(r, Color(0.5, 0.58, 0.72), false, 4.0)
+		txt(str(tdef["name"]), r.position.x + r.size.x * 0.5, r.position.y + 55.0, 28, Color.WHITE, 5)
+		var goal: int = int(tdef["goal"])
+		var prog: int = mini(int(task_prog[i]), goal)
+		var bar := Rect2(r.position.x + 30.0, r.position.y + 80.0, r.size.x - 60.0, 22.0)
+		draw_rect(bar, Color(0.25, 0.3, 0.45))
+		draw_rect(Rect2(bar.position, Vector2(bar.size.x * float(prog) / float(goal), bar.size.y)), Color(0.6, 1.0, 0.7))
+		if bool(task_done[i]):
+			txt("DONE!  +%d coins" % int(tdef["reward"]), r.position.x + r.size.x * 0.5, r.position.y + 132.0, 26, Color(0.6, 1.0, 0.7), 5)
+		else:
+			txt("%d / %d     reward +%d coins" % [prog, goal, int(tdef["reward"])], r.position.x + r.size.x * 0.5, r.position.y + 132.0, 26, Color(1.0, 0.95, 0.4), 5)
+	txt("New tasks every day", W * 0.5, 800.0, 28, Color.WHITE, 5)
 	draw_button(BACK_RECT, "BACK", 30, Color(0.4, 0.5, 0.7))
 
 
@@ -794,7 +1028,10 @@ func draw_play(show_hud: bool) -> void:
 func draw_hud() -> void:
 	draw_coin_pill()
 	for i in START_LIVES:
-		draw_heart(Vector2(W - 40.0 - float(i) * 50.0, 40.0), i < lives)
+		var hs := 1.0
+		if i == lives - 1 and heart_pulse > 0.0:
+			hs = 1.0 + 0.7 * sin(heart_pulse * PI)
+		draw_heart(Vector2(W - 40.0 - float(i) * 50.0, 40.0), i < lives, hs)
 	txt(str(score), W * 0.5, 190.0, 110, Color.WHITE, 12)
 
 
@@ -802,7 +1039,10 @@ func draw_over() -> void:
 	draw_rect(Rect2(0, 0, W, H), Color(0.1, 0.12, 0.2, 0.55))
 	txt(str(score), W * 0.5, 190.0, 110, Color.WHITE, 12)
 	draw_button(RETRY_RECT, "RETRY", 54, Color(0.9, 0.35, 0.35))
-	draw_mascot(mascot, "", "cry", Vector2(W * 0.5, 720.0), 400.0)
+	draw_mascot(mascot, "", "cry", Vector2(W * 0.5, 800.0), 380.0)
+	if not revived:
+		var can := total_coins >= REVIVE_COST
+		draw_button(REVIVE_RECT, "BOUNCE BACK %d" % REVIVE_COST, 30, Color(0.9, 0.35, 0.35) if can else Color(0.5, 0.5, 0.55))
 	var line := "BEST " + str(best) + "     +" + str(run_coins) + " coins"
-	txt(line, W * 0.5, 800.0, 34, Color.WHITE, 6)
+	txt(line, W * 0.5, 838.0, 34, Color.WHITE, 6)
 	draw_button(HOME_RECT, "HOME", 28, Color(0.4, 0.5, 0.7))
