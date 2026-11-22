@@ -14,6 +14,17 @@ const MASC_PLAY := 165.0
 const PANCAKE_H := 1.9   # drawn pancake height as a multiple of BH (about 65 px)
 const FALL_GRAV := 2600.0
 const START_LIVES := 3
+const MUSIC_BPM := 110
+const MUSIC_NOTES := [
+	[64, 0.5], [67, 0.5], [72, 1.0], [69, 0.5], [67, 0.5], [64, 1.0],
+	[62, 0.5], [64, 0.5], [67, 1.0], [64, 0.5], [62, 0.5], [60, 1.0],
+	[60, 0.5], [64, 0.5], [67, 1.0], [69, 0.5], [72, 0.5], [69, 1.0],
+	[67, 1.0], [64, 1.0], [62, 1.0], [0, 1.0],
+	[69, 0.5], [72, 0.5], [76, 1.0], [74, 0.5], [72, 0.5], [69, 1.0],
+	[67, 0.5], [69, 0.5], [72, 1.0], [69, 0.5], [67, 0.5], [64, 1.0],
+	[62, 0.5], [67, 0.5], [69, 1.0], [67, 0.5], [64, 0.5], [62, 1.0],
+	[60, 2.0], [0, 2.0],
+]   # [midi_note, beats], 0 = rest
 const MILESTONES := {
 	10: ["NICE!", Color(0.6, 1.0, 0.7)],
 	25: ["WOW!", Color(1.0, 0.85, 0.3)],
@@ -34,6 +45,7 @@ const TASK_POOL := [
 	{"kind": "score", "goal": 80, "reward": 30, "name": "Score 80 in one run"},
 ]
 const TASKS_RECT := Rect2(14, 76, 76, 76)
+const MUTE_RECT := Rect2(450, 76, 76, 76)
 const REVIVE_COST := 50
 const REVIVE_RECT := Rect2(110, 365, 320, 80)
 const SAVE_PATH := "user://save.cfg"
@@ -43,7 +55,7 @@ const OUTFITS := ["", "chef", "hacker", "wizard"]
 const OUTFIT_COST := {"chef": 30, "hacker": 100, "wizard": 250}
 const BGS := ["bg_sky", "bg_kitchen", "bg_night", "bg_peach", "bg_pink"]
 const FOLDERS := ["", "characters/", "blocks/", "ui/", "backgrounds/"]
-const TRIM := ["pancake", "plate", "rail", "coin", "heart", "heart_empty", "lock", "button", "logo", "clipboard", "tshirt"]
+const TRIM := ["pancake", "plate", "rail", "coin", "heart", "heart_empty", "lock", "button", "logo", "clipboard", "tshirt", "sound_on", "sound_off"]
 
 const GO_RECT := Rect2(150, 800, 240, 110)
 const WARD_RECT := Rect2(30, 810, 100, 100)
@@ -104,12 +116,16 @@ var parts: Array = []
 var _cache := {}
 var snd := {}
 var players: Array = []
+var music: AudioStreamPlayer
+var muted := false
 
 
 func _ready() -> void:
 	randomize()
 	load_save()
+	AudioServer.set_bus_mute(0, muted)
 	build_sounds()
+	start_music()
 	queue_redraw()
 
 
@@ -124,6 +140,7 @@ func load_save() -> void:
 	owned = cf.get_value("g", "owned", [])
 	outfit_of["orpheus"] = str(cf.get_value("g", "o_orpheus", ""))
 	outfit_of["hedgehog"] = str(cf.get_value("g", "o_hedgehog", ""))
+	muted = bool(cf.get_value("g", "muted", false))
 	task_date = str(cf.get_value("g", "t_date", ""))
 	var tp: Array = cf.get_value("g", "t_prog", [0, 0, 0])
 	var td: Array = cf.get_value("g", "t_done", [false, false, false])
@@ -210,6 +227,7 @@ func save_game() -> void:
 	cf.set_value("g", "owned", owned)
 	cf.set_value("g", "o_orpheus", outfit_of["orpheus"])
 	cf.set_value("g", "o_hedgehog", outfit_of["hedgehog"])
+	cf.set_value("g", "muted", muted)
 	cf.set_value("g", "t_date", task_date)
 	cf.set_value("g", "t_prog", task_prog)
 	cf.set_value("g", "t_done", task_done)
@@ -257,6 +275,73 @@ func build_sounds() -> void:
 		var p := AudioStreamPlayer.new()
 		add_child(p)
 		players.append(p)
+
+
+## Background music. Uses assets/music.ogg or music.mp3 if present, otherwise plays the tune in MUSIC_NOTES (if any).
+func start_music() -> void:
+	var stream: AudioStream = null
+	for ext in ["ogg", "mp3"]:
+		var path := "res://assets/music.%s" % ext
+		if ResourceLoader.exists(path):
+			var loaded = load(path)
+			if loaded is AudioStreamOggVorbis:
+				loaded.loop = true
+				stream = loaded
+			elif loaded is AudioStreamMP3:
+				loaded.loop = true
+				stream = loaded
+			if stream != null:
+				break
+	if stream == null and not MUSIC_NOTES.is_empty():
+		stream = build_tune()
+	if stream == null:
+		return
+	music = AudioStreamPlayer.new()
+	music.stream = stream
+	music.volume_db = -12.0
+	add_child(music)
+	music.play()
+
+
+## Turns MUSIC_NOTES into a looping wave with a soft synth tone.
+func build_tune() -> AudioStreamWAV:
+	var rate := 22050
+	var spb: float = 60.0 / float(MUSIC_BPM)
+	var data := PackedByteArray()
+	var phase := 0.0
+	for n in MUSIC_NOTES:
+		var midi: int = int(n[0])
+		var beats: float = float(n[1])
+		var count: int = int(float(rate) * spb * beats)
+		var base: int = data.size()
+		data.resize(base + count * 2)
+		var freq: float = 440.0 * pow(2.0, float(midi - 69) / 12.0)
+		for i in count:
+			var p: float = float(i) / float(count)
+			var env: float = minf(1.0, float(i) / 300.0) * minf(1.0, (1.0 - p) * 6.0)
+			var v := 0.0
+			if midi > 0:
+				phase += TAU * freq / float(rate)
+				v = sin(phase) * 0.7 + sin(phase * 2.0) * 0.15
+			data.encode_s16(base + i * 2, int(clampf(v * env * 0.3, -1.0, 1.0) * 32767.0))
+	var w := AudioStreamWAV.new()
+	w.format = AudioStreamWAV.FORMAT_16_BITS
+	w.mix_rate = rate
+	w.stereo = false
+	w.data = data
+	w.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	w.loop_begin = 0
+	w.loop_end = int(data.size() / 2)
+	return w
+
+
+## Mutes or unmutes all audio (music and sound effects) and remembers the choice.
+func toggle_mute() -> void:
+	muted = not muted
+	AudioServer.set_bus_mute(0, muted)
+	save_game()
+	if not muted:
+		play_snd("click")
 
 
 func play_snd(nm: String) -> void:
@@ -800,6 +885,8 @@ func handle_tap(p: Vector2) -> void:
 			if GO_RECT.has_point(p):
 				play_snd("click")
 				new_game()
+			elif MUTE_RECT.has_point(p):
+				toggle_mute()
 			elif TASKS_RECT.has_point(p):
 				play_snd("click")
 				check_task_day()
@@ -831,7 +918,10 @@ func handle_tap(p: Vector2) -> void:
 				play_snd("click")
 				state = "title"
 		"play":
-			play_tap()
+			if MUTE_RECT.has_point(p):
+				toggle_mute()
+			else:
+				play_tap()
 		"over":
 			if over_age < 0.35:
 				return
@@ -903,6 +993,7 @@ func draw_title() -> void:
 	draw_button(GO_RECT, "GO", 72, Color(0.9, 0.35, 0.35))
 	draw_icon_button(WARD_RECT, "tshirt", "DRESS")
 	draw_icon_button(TASKS_RECT, "clipboard", "TASKS")
+	draw_icon_button(MUTE_RECT, "sound_off" if muted else "sound_on", "OFF" if muted else "ON")
 	draw_button(MASC_RECT, "", 24, Color(0.4, 0.5, 0.7))
 	var other: String = MASCOTS[(MASCOTS.find(mascot) + 1) % MASCOTS.size()]
 	draw_mascot(other, "", "balance", MASC_RECT.position + Vector2(50, 90), 100.0)
@@ -1027,6 +1118,7 @@ func draw_play(show_hud: bool) -> void:
 
 func draw_hud() -> void:
 	draw_coin_pill()
+	draw_icon_button(MUTE_RECT, "sound_off" if muted else "sound_on", "OFF" if muted else "ON")
 	for i in START_LIVES:
 		var hs := 1.0
 		if i == lives - 1 and heart_pulse > 0.0:
